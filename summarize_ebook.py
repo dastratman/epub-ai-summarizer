@@ -6,6 +6,7 @@ import argparse
 import html2text
 import threading
 import signal
+import markdown
 from bs4 import BeautifulSoup
 import google.generativeai as genai
 from ebooklib import epub
@@ -14,6 +15,13 @@ from tqdm import tqdm
 import logging
 from pathlib import Path
 import hashlib
+import markdown
+from markdown.extensions.extra import ExtraExtension
+from markdown.extensions.nl2br import Nl2BrExtension
+from markdown.extensions.sane_lists import SaneListExtension
+
+# Add markdown library to requirements.txt
+# pip install markdown
 
 # Global termination flag
 should_terminate = False
@@ -86,36 +94,44 @@ class ChapterSummarizer:
 
         # CSS for the output ebook
         self.css = """
-        body {
-            font-family: "Bookerly", Georgia, "Times New Roman", serif;
-            line-height: 1.5;
-            margin: 2em;
-            color: #333;
-        }
-        h1 {
-            color: #2c3e50;
-            border-bottom: 1px solid #ddd;
-            padding-bottom: 0.5em;
-            margin-bottom: 1em;
-        }
-        h2 {
-            color: #3498db;
-            margin-top: 1.5em;
-        }
-        .key-point {
-            background-color: #f8f9fa;
-            border-left: 4px solid #3498db;
-            padding: 0.8em;
-            margin: 1em 0;
-        }
-        .character {
-            font-weight: bold;
-            color: #e74c3c;
-        }
-        .theme {
-            font-style: italic;
-            color: #27ae60;
-        }
+            body {
+                font-family: serif;
+                line-height: 1.5;
+                margin: 1em;
+                padding: 0;
+            }
+            
+            h1 {
+                font-size: 1.5em;
+                margin-bottom: 1em;
+            }
+            
+            h2, h3, h4 {
+                margin-top: 1.5em;
+                margin-bottom: 0.8em;
+            }
+            
+            p {
+                margin-top: 1em;
+                margin-bottom: 1em;
+                text-align: justify;
+            }
+            
+            strong, b {
+                font-weight: bold;
+            }
+            
+            em, i {
+                font-style: italic;
+            }
+            
+            
+            /* Ensure spacing between sections */
+            hr {
+                margin: 2em 0;
+                border: none;
+                border-top: 1px solid #ccc;
+            }
         """
 
     def _setup_gemini(self):
@@ -175,14 +191,14 @@ class ChapterSummarizer:
                 Please provide a comprehensive summary of the following section titled "{title}".
                 
                 Focus on capturing the essential information, main points, and significant details.
-                
+                                
                 CONTENT:
                 {text}
             """,
             "concise": """
                 Provide a concise summary of the following section titled "{title}". Focus only on key 
                 points and critical information. Keep it brief and to the point.
-                
+                                
                 CONTENT:
                 {text}
             """,
@@ -196,7 +212,7 @@ class ChapterSummarizer:
                 
                 Format your response with clear sections and maintain sufficient detail 
                 to understand the content and its significance.
-                
+                                
                 CONTENT:
                 {text}
             """,
@@ -209,7 +225,7 @@ class ChapterSummarizer:
                 4. SIGNIFICANCE: Why this content matters and its implications
                 
                 This should be detailed and insightful, focusing on deeper meaning and significance.
-                
+                                
                 CONTENT:
                 {text}
             """
@@ -275,223 +291,297 @@ class ChapterSummarizer:
         """Process the EPUB file and create a new one with summaries."""
         global should_terminate
 
-        # Read the input EPUB
-        book = epub.read_epub(input_path)
+        try:
+            # Read the input EPUB
+            book = epub.read_epub(input_path)
 
-        # Create a new EPUB for summaries
-        summary_book = epub.EpubBook()
-        orig_title = book.get_metadata('DC', 'title')[0][0]
-        summary_book.set_title(f"Summary of {orig_title}")
+            # Create a new EPUB for summaries
+            summary_book = epub.EpubBook()
 
-        # Try to copy metadata from original book
-        for namespace in book.metadata:
-            for meta_name, meta_value in book.metadata[namespace].items():
-                if meta_name != 'title':  # We already set a custom title
-                    try:
-                        for value in meta_value:
-                            summary_book.add_metadata(
-                                namespace, meta_name, value)
-                    except:
-                        pass  # Skip if metadata can't be copied
+            # Get title, safely
+            title_metadata = book.get_metadata('DC', 'title')
+            orig_title = title_metadata[0][0] if title_metadata and title_metadata[0] else "Unknown Title"
+            summary_book.set_title(f"Summary of {orig_title}")
 
-        # Add author information
-        summary_book.add_author("Generated by Gemini AI")
+            # Add minimal required metadata
+            summary_book.add_metadata('DC', 'language', 'en')
+            summary_book.add_metadata(
+                'DC', 'identifier', f'summary_{int(time.time())}')
+            summary_book.add_author("Generated by Gemini AI")
 
-        # Add CSS
-        css_file = epub.EpubItem(
-            uid="style_default",
-            file_name="style/default.css",
-            media_type="text/css",
-            content=self.css
-        )
-        summary_book.add_item(css_file)
-
-        # Create introduction chapter
-        intro = epub.EpubHtml(title="Introduction", file_name="intro.xhtml")
-        intro.add_item(css_file)
-        intro.content = f"""<html>
-        <head><link rel="stylesheet" href="style/default.css" type="text/css" /></head>
-        <body>
-            <h1>Introduction</h1>
-            <p>This book contains AI-generated summaries of each section from 
-            "{orig_title}".</p>
-            <p>Summaries were created using Google's Gemini AI model 
-            with the '{self.summary_style}' style.</p>
-            <p>Generated on: {time.strftime('%Y-%m-%d')}</p>
-        </body>
-        </html>"""
-        summary_book.add_item(intro)
-
-        # Keep track of our chapters for the table of contents
-        chapters = [intro]
-        toc = [(epub.Section('Summaries'), [])]
-
-        # Identify real chapters (filtering out front/back matter)
-        content_items = []
-        for item_id, linear in book.spine:
-            if should_terminate:
-                break
-
-            if item_id == 'nav':
-                continue
-
-            item = book.get_item_with_id(item_id)
-
-            if isinstance(item, epub.EpubHtml):
-                # Extract text to check if this is likely a content chapter
-                soup = BeautifulSoup(item.content, 'html.parser')
-                text_content = soup.get_text()
-
-                # Heuristic: If it has enough text, it's likely a content chapter
-                if len(text_content) > 500:
-                    title_tag = soup.find(['h1', 'h2', 'h3'])
-                    title = title_tag.text.strip(
-                    ) if title_tag else f"Section {len(content_items) + 1}"
-                    content_items.append((item, title))
-
-        logger.info(
-            f"Found {len(content_items)} content sections to summarize")
-
-        # Function to process a single chapter
-        def process_chapter(idx, item_tuple):
-            global should_terminate
-
-            if should_terminate:
-                return idx, None, item_tuple[1], "Skipped due to termination request"
-
-            item, chapter_title = item_tuple
+            # Safely copy selected metadata from original book
             try:
-                # Extract text
-                chapter_text = self.extract_text_from_html(item.content)
-
-                # Get summary
-                logger.info(f"Processing: {chapter_title}")
-                summary = self.get_chapter_summary(chapter_title, chapter_text)
-
-                # Format the summary as HTML with nicer structure
-                formatted_summary = self._format_summary_html(
-                    summary, chapter_title)
-
-                # Create the chapter
-                summary_chapter = epub.EpubHtml(
-                    title=f"Summary: {chapter_title}",
-                    file_name=f"summary_{idx:03d}.xhtml"
-                )
-                summary_chapter.add_item(css_file)
-                summary_chapter.content = formatted_summary
-
-                return idx, summary_chapter, chapter_title, None
-
+                for metadata_type in ['creator', 'subject', 'description', 'publisher', 'source']:
+                    meta_values = book.get_metadata('DC', metadata_type)
+                    if meta_values:
+                        for meta_value in meta_values:
+                            # Check that value isn't None
+                            if meta_value and meta_value[0]:
+                                summary_book.add_metadata(
+                                    'DC', metadata_type, meta_value[0])
             except Exception as e:
-                error_msg = str(e)
+                logger.warning(f"Error copying metadata: {e}")
+
+            # Add CSS
+            css_file = epub.EpubItem(
+                uid="style_default",
+                file_name="style/default.css",
+                media_type="text/css",
+                content=self.css
+            )
+            summary_book.add_item(css_file)
+
+            # Create introduction chapter
+            intro = epub.EpubHtml(title="Introduction",
+                                  file_name="intro.xhtml")
+            intro.add_item(css_file)
+            intro.content = f"""<html>
+            <head><link rel="stylesheet" href="style/default.css" type="text/css" /></head>
+            <body>
+                <h1>Introduction</h1>
+                <p>This book contains AI-generated summaries of each section from 
+                "{orig_title}".</p>
+                <p>Summaries were created using Google's Gemini AI model ({self.model_name})
+                with the '{self.summary_style}' style.</p>
+                <p>Generated on: {time.strftime('%Y-%m-%d')}</p>
+            </body>
+            </html>"""
+            summary_book.add_item(intro)
+
+            # Keep track of our chapters for the table of contents
+            chapters = [intro]
+            toc = [(epub.Section('Summaries'), [])]
+
+            # Identify real chapters (filtering out front/back matter)
+            content_items = []
+            for item_id, linear in book.spine:
+                if should_terminate:
+                    break
+
+                if item_id == 'nav':
+                    continue
+
+                item = book.get_item_with_id(item_id)
+
+                if isinstance(item, epub.EpubHtml):
+                    # Extract text to check if this is likely a content chapter
+                    soup = BeautifulSoup(item.content, 'html.parser')
+                    text_content = soup.get_text()
+
+                    # Heuristic: If it has enough text, it's likely a content chapter
+                    if len(text_content) > 500:
+                        title_tag = soup.find(['h1', 'h2', 'h3'])
+                        title = title_tag.text.strip(
+                        ) if title_tag else f"Section {len(content_items) + 1}"
+                        content_items.append((item, title))
+
+            logger.info(
+                f"Found {len(content_items)} content sections to summarize")
+
+            # Function to process a single chapter
+            def process_chapter(idx, item_tuple):
+                global should_terminate
+
+                if should_terminate:
+                    return idx, None, item_tuple[1], "Skipped due to termination request"
+
+                item, chapter_title = item_tuple
+                try:
+                    # Extract text
+                    chapter_text = self.extract_text_from_html(item.content)
+
+                    # Get summary
+                    logger.info(f"Processing: {chapter_title}")
+                    summary = self.get_chapter_summary(
+                        chapter_title, chapter_text)
+
+                    # Format the summary as HTML with nicer structure
+                    formatted_summary = self._format_summary_html(
+                        summary, chapter_title)
+
+                    # Create the chapter
+                    summary_chapter = epub.EpubHtml(
+                        title=f"Summary: {chapter_title}",
+                        file_name=f"summary_{idx:03d}.xhtml"
+                    )
+                    summary_chapter.add_item(css_file)
+                    summary_chapter.content = formatted_summary
+
+                    return idx, summary_chapter, chapter_title, None
+
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(
+                        f"Error processing '{chapter_title}': {error_msg}", exc_info=True)
+                    return idx, None, chapter_title, error_msg
+
+            # Process chapters in parallel with a progress bar
+            processed_chapters = []
+
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {executor.submit(process_chapter, i, item_tuple): i
+                           for i, item_tuple in enumerate(content_items)}
+
+                with tqdm(total=len(content_items), desc="Summarizing sections") as progress:
+                    for future in futures:
+                        if should_terminate:
+                            executor.shutdown(wait=False)
+                            logger.info(
+                                "Cancelling remaining tasks due to termination request")
+                            break
+
+                        idx, chapter, title, error = future.result()
+                        if chapter:
+                            processed_chapters.append((idx, chapter, title))
+                        elif error:
+                            logger.error(
+                                f"Failed to process section {title}: {error}")
+                        progress.update(1)
+
+                        # Check for termination flag periodically
+                        if should_terminate:
+                            break
+
+            # If termination was requested, save what we have so far
+            if should_terminate:
+                logger.info("Termination requested. Saving partial results...")
+
+            # Sort by original order and add to book
+            processed_chapters.sort(key=lambda x: x[0])
+            for idx, chapter, title in processed_chapters:
+                if chapter:
+                    summary_book.add_item(chapter)
+                    chapters.append(chapter)
+                    toc[0][1].append(chapter)
+
+            # Add default NCX and Nav files
+            summary_book.add_item(epub.EpubNcx())
+            nav = epub.EpubNav()
+            nav.add_item(css_file)
+            summary_book.add_item(nav)
+
+            # Define the book's spine
+            summary_book.spine = ['nav'] + chapters
+
+            # Add TOC
+            summary_book.toc = toc
+
+            # Write the epub file
+            if len(chapters) > 1:  # Only write if we have at least some content
+                epub.write_epub(output_path, summary_book)
+                logger.info(f"Wrote summary EPUB to {output_path}")
+                return len(processed_chapters)
+            else:
                 logger.error(
-                    f"Error processing '{chapter_title}': {error_msg}", exc_info=True)
-                return idx, None, chapter_title, error_msg
+                    "No sections were successfully processed. EPUB not created.")
+                return 0
 
-        # Process chapters in parallel with a progress bar
-        processed_chapters = []
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(process_chapter, i, item_tuple): i
-                       for i, item_tuple in enumerate(content_items)}
-
-            with tqdm(total=len(content_items), desc="Summarizing sections") as progress:
-                for future in futures:
-                    if should_terminate:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        logger.info(
-                            "Cancelling remaining tasks due to termination request")
-                        break
-
-                    idx, chapter, title, error = future.result()
-                    if chapter:
-                        processed_chapters.append((idx, chapter, title))
-                    elif error:
-                        logger.error(
-                            f"Failed to process section {title}: {error}")
-                    progress.update(1)
-
-                    # Check for termination flag periodically
-                    if should_terminate:
-                        break
-
-        # If termination was requested, save what we have so far
-        if should_terminate:
-            logger.info("Termination requested. Saving partial results...")
-
-        # Sort by original order and add to book
-        processed_chapters.sort(key=lambda x: x[0])
-        for idx, chapter, title in processed_chapters:
-            if chapter:
-                summary_book.add_item(chapter)
-                chapters.append(chapter)
-                toc[0][1].append(chapter)
-
-        # Add default NCX and Nav files
-        summary_book.add_item(epub.EpubNcx())
-        nav = epub.EpubNav()
-        nav.add_item(css_file)
-        summary_book.add_item(nav)
-
-        # Define the book's spine
-        summary_book.spine = ['nav'] + chapters
-
-        # Add TOC
-        summary_book.toc = toc
-
-        # Write the epub file
-        if len(chapters) > 1:  # Only write if we have at least some content
-            epub.write_epub(output_path, summary_book)
-            logger.info(f"Wrote summary EPUB to {output_path}")
-            return len(processed_chapters)
-        else:
-            logger.error(
-                "No chapters were successfully processed. EPUB not created.")
-            return 0
+        except Exception as e:
+            logger.error(f"Error in process_epub: {e}", exc_info=True)
+            raise
 
     def _format_summary_html(self, summary, chapter_title):
-        """Format the summary text as nicely structured HTML."""
-        # Start with the basic HTML structure
+        """Format the summary text as nicely structured HTML with proper list structure."""
+        # Start with basic HTML structure
         formatted_html = "<html>\n<head><link rel=\"stylesheet\" href=\"style/default.css\" type=\"text/css\" /></head>\n<body>\n"
         formatted_html += f"<h1>Summary: {chapter_title}</h1>\n"
 
-        # Identify section headers (usually prefixed with numbers, hashtags, or all caps)
-        section_pattern = r'(?:\d+\.\s*|#+\s*|^[A-Z\s]{5,}$)(.*?)(?=(?:\d+\.\s*|#+\s*|^[A-Z\s]{5,}$)|$)'
-        sections = re.findall(section_pattern, summary,
-                              re.MULTILINE | re.DOTALL)
+        # Fix common markdown formatting issues before converting
+        cleaned_summary = self._clean_markdown_lists(summary)
 
-        # If we identified clear sections, format them nicely
-        if len(sections) > 2:
-            # Try to extract section titles and content
-            for section in sections:
-                lines = section.strip().split('\n', 1)
-                if len(lines) > 1:
-                    section_title, content = lines
-                    # Clean up title
-                    section_title = section_title.strip().rstrip(':')
-                    formatted_html += f"<h2>{section_title}</h2>\n"
-                    formatted_html += "<div class=\"section-content\">\n"
-                    formatted_html += content.replace('\n', '<br/>')
-                    formatted_html += "\n</div>\n"
-                else:
-                    formatted_html += "<div class=\"section-content\">\n"
-                    formatted_html += section.replace('\n', '<br/>')
-                    formatted_html += "\n</div>\n"
-        else:
-            # If no clear sections, just format with paragraph breaks
-            paragraphs = summary.split('\n\n')
-            for para in paragraphs:
-                if para.strip():
-                    # Highlight any clear key points
-                    if para.strip().lower().startswith(('key point', 'important', 'note:')):
-                        formatted_html += f"<div class=\"key-point\">{para}</div>\n"
-                    else:
-                        formatted_html += f"<p>{para}</p>\n"
+        # Convert to HTML
+        html_content = markdown.markdown(
+            cleaned_summary,
+            extensions=[ExtraExtension(), Nl2BrExtension(),
+                        SaneListExtension()],
+            output_format='html5'
+        )
 
-        # Close the HTML tags
-        formatted_html += "</body>\n</html>"
+        # Add the converted HTML content
+        formatted_html += html_content
+        formatted_html += "\n</body>\n</html>"
 
         return formatted_html
+
+    def _clean_markdown_lists(self, text):
+        """Fix markdown list formatting issues for proper HTML conversion."""
+        # Split into lines for processing
+        lines = text.split('\n')
+        result_lines = []
+
+        # Track if we're in a list to add proper spacing
+        in_list = False
+        list_indent_level = 0
+
+        for i, line in enumerate(lines):
+            # Check if this is a list item (numbered or bullet)
+            list_match = re.match(r'^(\s*)(\*|\d+\.)\s+(.*)', line)
+
+            if list_match:
+                spaces, marker, content = list_match.groups()
+                indent_level = len(spaces) // 4
+
+                # Format as proper markdown list item
+                if marker == '*':
+                    # Bullet list
+                    formatted_line = ('    ' * indent_level) + '* ' + content
+                else:
+                    # Numbered list
+                    formatted_line = ('    ' * indent_level) + \
+                        marker + ' ' + content
+
+                # Add empty line before list starts if needed
+                if not in_list and i > 0 and result_lines and result_lines[-1].strip():
+                    result_lines.append('')
+
+                result_lines.append(formatted_line)
+                in_list = True
+                list_indent_level = indent_level
+            else:
+                # Not a list item - check if we're exiting a list
+                if in_list and line.strip():
+                    # Add empty line after list ends
+                    if result_lines and result_lines[-1].strip():
+                        result_lines.append('')
+                    in_list = False
+
+                result_lines.append(line)
+
+        return '\n'.join(result_lines)
+
+    def _preprocess_markdown(self, text):
+        """Pre-process text to ensure proper markdown formatting."""
+        # Fix numbered lists (ensure proper spacing)
+        text = re.sub(r'(\n\d+\.)\s+', r'\n\1 ', text)
+
+        # Fix bullet lists with asterisks (ensure proper spacing)
+        text = re.sub(r'(\n\*)\s+', r'\n\1 ', text)
+
+        # Fix markdown lists that start with dashes
+        text = re.sub(r'(\n-)\s+', r'\n\1 ', text)
+
+        # Ensure empty line before lists for proper markdown parsing
+        text = re.sub(r'([^\n])\n(\d+\.\s)', r'\1\n\n\2', text)
+        text = re.sub(r'([^\n])\n(\*\s)', r'\1\n\n\2', text)
+        text = re.sub(r'([^\n])\n(-\s)', r'\1\n\n\2', text)
+
+        # Convert markdown lists that use incorrect format (1. text<br> style)
+        lines = text.split('\n')
+        in_list = False
+        for i in range(len(lines)):
+            # Check for list items in paragraphs using <br>
+            if not in_list and (re.match(r'^\d+\.\s+', lines[i]) or re.match(r'^\*\s+', lines[i]) or re.match(r'^-\s+', lines[i])):
+                # Insert blank line before list starts
+                if i > 0 and lines[i-1].strip():
+                    lines[i] = '\n' + lines[i]
+                in_list = True
+            elif in_list and not (re.match(r'^\d+\.\s+', lines[i]) or re.match(r'^\*\s+', lines[i]) or re.match(r'^-\s+', lines[i])):
+                # List ended
+                if lines[i].strip():
+                    lines[i] = '\n' + lines[i]
+                in_list = False
+
+        return '\n'.join(lines)
 
 
 def main():

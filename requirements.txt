@@ -1,5 +1,6 @@
-ebooklib>=0.17.1
-beautifulsoup4>=4.12.0
-html2text>=2020.1.16
-google-generativeai>=0.3.0
-tqdm>=4.65.0
+beautifulsoup4
+ebooklib
+google-generativeai
+html2text
+markdown
+tqdm
